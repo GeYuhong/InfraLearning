@@ -1,0 +1,4 @@
+1. torch.autograd.set_detect_anomaly(True)
+2. max connextion
+3. avoid record stream
+4. 矩阵运算的 flops mnk 是否有考虑乘和加？
