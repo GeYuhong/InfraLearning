@@ -1,5 +1,5 @@
 
-# 入口
+# 1. 入口
 
 从实现层面，将 cuda graph 接入到正式的训练修改。由于 cuda graph 替换的是某个前反向处理流程，可以在该处理的流程最外层的 `forward` 函数处增加 cuda graph 分支，该分支会调用一个独立的 graph manager 进行 ve cuda graph 前反向处理流程。
 
@@ -64,7 +64,7 @@ class HybridVLMainModel:
 
 这里的 graph.mode 用于控制是否 capture 反向的 graph，因为在实际训练中，某些阶段会 freeze ve/ae 的更新，此时仅需要 forward graph；defer_capture 表示是否延迟捕获 cuda graph，当为 false 时，首次调用 ve 就会自行 warmup 并 capture，否则只是执行普通前向并等待 trainer 后续统一安排捕获 ve graph 的实际和顺序，目的是实现 ve graph 和 llm graph 的显存池共享和显存复用。显存复用并不是 ve cuda graph 本身的主体功能必要能力，而是在主体功能的基础上新增的显存优化，利用了 ve 和 llm 的前反向计算在时间上完全错开的特点，可以让同一块显存空间同时被 ve graph 和 llm graph 使用，只要确保使用时不存在时间上的 overlap，就不会出现数据踩踏。
 
-# 变长序列处理
+# 2. 变长序列处理
 
 vision encoder 处理的序列是变长的，但是 cuda graph 要求输入数据的 shape 必须静态、固定不变，因为需要分配固定的显存给特定的 graph。解决这个问题的方式之一是，给定一个固定的 max tokens 值和 max segments 值，作为 graph 进行前反向计算时 capture 所用的静态 shape。实际的 tokens 小于等于固定的 max tokens，图片的数量也小于等于 max segments，当有任何一个超出时，框架均会报错。包含在 max tokens 内但不属于实际有效 tokens 的部分都被 padding 处理。
 
@@ -130,9 +130,9 @@ def forward(self, images: torch.Tensor) -> torch.Tensor:
 
 这里提到的输入序列长度为 max tokens，比较好理解，其直接对输入数据进行了限制；而输入的 cu_seqlen 的长度之所以是 max srgments + 2，是因为原本 cu_seqlen 本身的长度就是图片数量加1，其首元素为 0，并且还需要考虑到一个边界情况，即真实的 segments 数量就是 max segments，但真是的  tokens 数量小于 max tokens，此时被 padding 的部分也是一段 segment，因此额外需要一个 cu seqlen 的槽位，此时 cu seqlen 的长度就是 max segments + 1 + 1。
 
-# 建图与显存缓冲区如何保存
+# 3. 建图与显存缓冲区如何保存
 
-## 初始化阶段
+## 3.1 初始化阶段
 
 第二节提到的抽象对象是通过 padding 的方式实现定长的 ve 前反向计算，但是不涉及对 graph 进行 capture 和 replay 的行为，后者是更加上层的单个 graph 的行为管理，而且前者则主要是具体的执行层。因此我们需要抽象出一个新的类，重点关注如何捕获 graph、保存显存缓冲区、replay。在前向 replay 完成后，反向还需要使用前向计算留下的中间结果，如果这些中间结果占用的显存缓冲区被下一批数据占用了，反向计算就会出错，要新抽象出的这个类可以负责将这些缓冲区与 graph 的 pending 状态放在一起，集中管理缓冲区“什么时候可以使用、什么时候必须等待、什么时候可以清理”，可以定义如下 `_GraphSlot` 类：
 
@@ -248,7 +248,7 @@ with (
 
 graph slot 的入参 `defer_capture` 会绝对是否立即进行 graph 捕获。不推迟捕获时，先捕获前向，再按需捕获反向。反向使用外部指定的显存池；没有指定时，使用前向图的显存池，让两者具备共享池内显存的条件。`finish_capture()` 负责流之间的依赖衔接、清理梯度，以及恢复之前备份的 MoE 计数。这里的 `defer_capture` 只负责推迟 capture，前面三轮 warmup 是始终会进行的。通常 cuda graph manager 的 `prepare_capture()` 创建 graph slot 时默认直接传入 True，再由 manager 分步骤调用后续的捕获方法。
 
-## 捕获前向 graph
+## 3.2 捕获前向 graph
 
 graph slot 最核心的功能之一是 capture graph，并且前向和反向 graph 是分开的，首先讨论 capture forward graph 的流程:
 
@@ -303,7 +303,7 @@ def _te_capture(self):
 
 第三个重要的自定义上下文管理器是 `retain_fa_capture_outputs()`，它用于保留 ve 的 fa4 选择性重计算路径中，前向捕获产生的两类张量：一是 `out`，即 FlashAttention 的输出；二是 `lse`，即 softmax 的 log-sum-exp 统计量，反向计算需要它。在这个上下文管理器中， `self.fa_saved_outputs` 会被临时登记为收集列表，在执行到对应的 FlashAttention 前向时，会执行  `outputs.extend((out.detach(), lse.detach()))`，其中 `detach()` 与原张量共享显存，所以这里只增加引用，不复制数据。这里保留的原因是，cuda graph 记录了这些张量的显存地址，保留引用可以防止它们的存储过早被分配器复用，保证之后反向 replay 仍能读取正确的数据。每轮前向 replay 都会将新计算的 `out` 和 `lse` 写入这些固定地址。退出 上下文管理器是，只会恢复收集上下文，列表中的引用将继续保留，直到 `slot.reset()` 清空。 
 
-## 捕获反向 graph
+## 3.3 捕获反向 graph
 
 与捕获前向 graph 相对应的，当训练会涉及到反向传播时，也需要捕获反向 graph，供训练时反复 replay。下面展示的是剔除了一系列正确性检查后的主体执行流程：
 
@@ -368,7 +368,7 @@ for parameter, value in zip(
 return (None, None, None, *slot.parameter_grads)
 ```
 
-## finish_capture
+## 3.4 finish_capture
 
 除了前面 capture graph 的逻辑外，框架一般还有捕获完成后的收尾操作，通常是衔接 stream 的执行顺序、整理输出和梯度状态、恢复专家计数器，均为后续正式训练做准备。这部分收尾处理通常是框架的自定义行为，完整代码如下：
 
@@ -390,7 +390,7 @@ def finish_capture(self) -> None:
 
 最后一个收尾操作是恢复 MoE 专家的 token 计数器。在 `__init__()` 中，graph slot 收集了各模块的 assigned_tokens_per_expert，并在 warmup 之前通过 clone() 备份了它们的数值，即 `self.saved_counters`。warmup 等准备过程会经过 router，可能改变专家分配统计。因此这里将每个计数器恢复到准备之前的值，避免把这些准备工作统计成正式训练数据。这里是恢复备份值，不一定是清零：如果备份时已经有计数，就恢复那些计数。copy_() 在原计数器张量上修改数值，保留原来的对象和存储；strict=True 要求计数器与备份数量一致，否则会报错。
 
-## prepare
+## 3.5 prepare
 
 在做完了捕获的收尾操作后、真正执行 replay 操作前，还需要少量 replay 前的准备工作，这部分行为被整理到了 `prepare` 函数中。区别于建图行为，每一个 graph slot 只需要建图一次，但是 replay 的准备操作是依赖于 replay 的，因此多次 replay 意味着 `prepare` 会被反复多次调用：
 
@@ -407,23 +407,169 @@ tokens = self.fixed_ve.set_layout(images, grid_thw)
 
 长度为 max tokens 的输入张量 images 也在 `prepare` 中被真实 token 数据复制，剩下的 token 位置则直接置 0。最终返回的是本次计算的真实 token 数量。
 
+# 4. cuda graph 接入训练流程
+
+## 4.1 自定义模块的前向
+
+cuda graph 接入训练流程是通过一个自定义模块实现的，该自定义模块的前向依赖真实的输入 images 和用于控制 replay 的 slot，而反向会返回 replay 后得到的权重参数梯度，这就要求前向函数输入中有权重参数的站位，因此该类的前向函数可以定义为：
+
+```python
+class _ForwardBackwardReplay(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, slot, images, grid_thw, *parameters):
+        if slot.pending:
+            raise RuntimeError("VE CUDA Graph slot already has an outstanding forward")
+        tokens = slot.prepare(images, grid_thw)
+        slot.forward_graph.replay()
+        slot.pending = True
+        ctx.slot = slot
+        ctx.tokens = tokens
+        return slot.output[:tokens].clone()
+```
+
+graph slot 在自定义模块输入函数中的角色非常重要，首先会判断当前传入的 graph slot 是否还在等待上一次的反向，若该 graph slot 的反向还没有处理完，那会拦截本次前向 replay 操作。因为反向需要对应前向保存在固定缓冲区里的中间结果。如果此时再次使用同一个 slot 做前向，新结果可能覆盖旧结果，让上一次反向读到错误的数据。因此，必须等对应反向处理完、释放 slot 后才能复用。
+
+`forward()` 的输入 `images` 和 `grid_thw` 均为真实数据，因此在 replay 之前必须首先将真实数据放在 replay 使用的固定缓存区，即 `slot.prepaer()` 函数的作用，前一小节详细解释过，该函数会检查输入是否兼容，更新本轮的序列边界、位置编码和有效 token 编码，将 `images` 复制到 graph slot 的固定输入缓冲区，并将 padding 部分清零。 `prepare()` 返回的 tokens 是本轮真实的 token 数，也就是 `images.shape[0]`，虽然 replay 会按照固定的 `max_tokens` 容量运行，但代码会记住真实数据占多少位置。
+
+完成了前序准备工作后，直接调用 graph slot 维护的前向图进行 replay 即可，这才正式发起了本轮 ve 的前向 GPU 计算，前向图读取准备好的输入 `images` 和布局，以及当前参数，写出本轮输出和反向所需的中间结果。图的输出写入 slot 持有的固定输出存储，所以后面的 `slot.output` 能读到这次的结果。这里已经进入 replay 阶段，不再进行捕获。
+
+`forward()` 函数中剩下的处理则是服务于反向函数 `backward()` 和状态记录，即设置当前使用的 graph slot 的 `pending` 为 true，并将 graph slot 和 真实的 token 数都保存给反向使用，确保反向处理时知道梯度应该写入固定显存缓冲区的哪些位置。后续自定义的 `backward()` 函数在处理反向后，会将状态标记 `pending` 恢复成 false。需要注意的一点是，**前向函数最终返回结果时，返回的是真实 token 对应的输出，去掉了 padding 部分**。对返回的结果进行 `clone()` 也是必要的，因为当前使用的 graph slot 有可能后续被再次使用，并且被使用时，此前已有的输出结果可能还未被完全使用完成（例如多次 ve forward 前向完成后，再将多次 forward 的结果一起传给 llm backbone 部分处理），此时再次调用 `forward()` 会覆盖已有的输出，因此**有必要通过 `clone()` 复制成独立的 tensor**。
+
+`forward()` 函数的输入中还有一个重要的参数是解包的 `*parameters`。被更新权重参数虽然不会在 `forward()` 函数中被显示使用，并且也不会被通过 ctx 保留给反向函数使用，但是依然要在这里传入，主要的原因有两个：首先，前向函数的输入中只有 images 拥有 `requires_grad` 属性，并且通常是 false，这意味着这个自定义模块不会创建对应的 autograd 反向节点，它的反向函数不会被调用执行，反向图不会进行 replay，这与预期的训练流程是完全不符的，因此提供被更新参数作为输入，可以将该自定义模块加入到训练的反向计算图中；第二，在后续进行反向 replay 时，真实计算得到的权重参数梯度有两种可能的存放位置，一个是写入到了捕获时绑定的参数梯度存储中，并在本自定义模块的反向返回，由外层 autograd/DDP 继续处理并累加到 `main_grad` 中，另一个存放位置时在 GPU 算子执行时直接将结果累加到 `main_grad` 中，此时本自定义模块返回的参数权重梯度主要起占位作用，配合后续待执行的 autograd/DDP hook，真实的梯度已经在 `main_grad` 中。
+
+## 4.2 自定义模块的反向
+
+自定义模块的反向依然依赖 graph slot 对显存管理和控制反向图 replay 的能力，因此首先取回 `forward()` 函数保存的 graph slot 对象，并进行基本的状态检查，确保当前 graph slot 是已经经过了前向流程、实际 token 数量的匹配检验、共享显存池是否已经进行了清零（展开来说，最后的 grad 检查与显存复用有关。共享图池中的梯度存储在其他计算阶段可能被 LLM 临时数据占用；进入视觉分支反向前，需要先将相应的梯度缓冲区清零，再开始累加本轮梯度。捕获阶段完成分配和绑定，正式运行时 replay 已记录的初始化操作）：
+
+```python
+class _ForwardBackwardReplay(torch.autograd.Function):
+    @staticmethod
+    def backward(ctx, gradient):
+        slot = ctx.slot
+        if not slot.pending:
+            raise RuntimeError("VE CUDA Graph backward has no matching forward")
+        if slot.requires_grad_init and not slot.grad_initialized:
+            raise RuntimeError("VE backward requires grad-init replay before adapter backward")
+        if gradient.shape != slot.grad_output[: ctx.tokens].shape:
+            raise ValueError("VE CUDA Graph output gradient shape changed")
+        slot.grad_output.zero_()
+        slot.grad_output[: ctx.tokens].copy_(gradient)
+        try:
+            slot.backward_graph.replay()
+            # Replay cannot update Python-side DDP bookkeeping captured in the graph.
+            for parameter, value in zip(slot.parameters, slot.grad_added_to_main_grad, strict=True):
+                parameter.grad_added_to_main_grad = value
+            return (None, None, None, *slot.parameter_grads)
+        finally:
+            slot.pending = False
+            slot.grad_initialized = False
+```
+
+`backward()` 函数首先接收下游回传的梯度 `gradient`，这个梯度张量的序列长度是真实 token 数量，对应前向 `forward()` 函数的输出。当前反向图是包裹的整个 vision encoder，而在 ve 和 llm backbone 之间其实还存在一个规模很小的 vision adaptor，在执行到 ve 反向图时，vision adaptor 的反向计算已经完成，因此此时的梯度缓冲区中已经存储了 vision adaptor 的梯度数据，无法在反向图开始 replay 前对梯度缓存区进行清零，否则会抹去 vision adaptor 的梯度数据。正确的清理时间点是在进行整个 vision model 的反向前，在完成了 llm backbone 的反向后，进行梯度缓存区的清理：
+
+```text
+调度层在视觉分支反向前执行 grad-init
+    → adapter 反向，写入 adapter 参数梯度
+    → 到达这里的 VE backward，检查初始化标记
+    → VE 反向 replay，写入 VE 参数梯度
+```
+
+接来下会把真实回传的梯度 `gradient` 赋值到固定分配的回传梯度的缓冲区，具体行为就是先把后者置零再进行原地拷贝 `copy_()`。此时反向图 replay 的所需准备工作就已经全部完成了，可以通过 graph slot 直接调用反向图的 replay。反向图 replay 后，由于对图进行 capture 时仅捕捉到 GPU 操作，因此 param 的一些关键属性存在丢失，所以需要将 capture 阶段记录留存的 `grad_added_to_main_grad` 属性重新挂载在 param 上，后续 DDP hook 会据此决定是否还需要把普通 `.grad` 累加进 `main_grad`，避免将已经直接累加的真实梯度重复计入。这里 `strict=True` 则要求两个序列长度一致，防止参数与标记数量不匹配时被 `zip()` 静默截断。
+
+最后 `backward()` 返回 `parameter_grads` 的原因已经在上一小节提到了，不管其是真实的梯度数据还是只是占位，都会与后续的 DDP hook 进行配合。返回退出时需要同步进行的是清理本轮 graph slot 状态，将 `pending` 和 `grad_initialized` 都置为 false。设置这两个布尔值不会清零梯度，也不是 GPU 同步。replay 通常是异步提交，GPU 操作的先后关系仍由 CUDA stream 和相应同步机制保证。注意，前面的状态检查、形状检查和梯度复制位于 try 外面；如果在那里报错，这个 finally 不会执行。即使 try 内报错后标记被重置，也不代表 GPU 或训练状态已自动恢复，可以直接继续训练。
+
+## 4.3 graph slot 中的前反向流程
+
+前两个小节的自定义模块 `_ForwardBackwardReplay` 由 graph slot 直接调用：
+
+```python
+def forward_backward(self, images: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    return _ForwardBackwardReplay.apply(self, images, grid_thw, *self.parameters)
+```
+
+但这个自定义模块仅会在 ve 训练流程既包含前向传播又包含反向传播时被调用。实际训练还有另一种场景，即 freeze encoder，仅更新 adaptor 部分的权重，此时 capture 环节只会捕捉前向图，训练流程中也不涉及反向图的 replay，此时框架也无需用自定义模块包裹该流程，直接回放前向图即可：
+
+```python
+def forward_only(self, images: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        tokens = self.prepare(images, grid_thw)
+        self.forward_graph.replay()
+        # VA backward saves this input, so it must not alias the next graph replay.
+        return self.output[:tokens].clone()
+```
+
+# 5. ve cuda graph manager 维护 cuda graph 的完整生命周期
+
+## 5.1 初始化 manager
+
+ve cuda graph manager 在初始化环节会保存一系列参数配置，建立尚未捕获图的初始状态：
+
+```python
+class VECudaGraphManager:
+    def __init__(
+        self,
+        tower: torch.nn.Module,
+        max_tokens: int,
+        max_segments: int,
+        max_inflight: int,
+        zero_grad_buffer: Callable[[], None],
+        no_sync: Callable,
+        mode: str,
+        capture_stream: torch.cuda.Stream | None = None,
+        pool=None,
+        defer_capture: bool = False,
+    ) -> None:
+        if mode not in {"forward", "forward_backward"}:
+            raise ValueError(f"unsupported VE CUDA Graph mode: {mode}")
+        if max_inflight != 1:
+            raise ValueError("VE CUDA Graph requires max_inflight=1")
+        self.tower = tower
+        self.max_tokens = int(max_tokens)
+        self.max_segments = int(max_segments)
+        self.max_inflight = int(max_inflight)
+        self.zero_grad_buffer = zero_grad_buffer
+        self.no_sync = no_sync
+        self.mode = mode
+        self.capture_stream = capture_stream
+        self.pool = pool
+        self.defer_capture = defer_capture
+        self.slots: list[_GraphSlot] = []
+        self.graphs_ready = False
+        self.grad_init_graph = None
+        self._capture_template = None
+```
+
+初始化环节首先做的第一件事是检查执行模式和允许的未完成的前向数量，即 `mode` 和 `max_inflight` 的取值。在第四章节有提到过目前允许的有效 `mode` 类型，分别是 `forward` 和 `forward_backward`。实际 yaml 中支持的可选 value 还有 `off`，但是取该值时，ve cuda graph manager 的外层函数 `_configure_ve_cuda_graph()` 会直接返回，不会创建 ve cuda graph manager。`max_inflight` 表示最多允许多少次前向已经执行且对应反向还没有处理完。通常使用时设置为 1，因此每个 manager 只创建一个 graph slot。它与 world size 和 segment number 都无关，也不表示一个 graph slot 只能持有一张图：训练模式的 slot 同时持有前向图和反向图。
+
+初始化环节做的第二件事是保存要运行的模型以及固定容量配置，即 `tower`、`max_tokens`、`max_segments` 和 `max_inflight`。前者是已有的 vision encoder 模型，例如有些框架的 `tower` 其实是 `vision_encoder.vision_tower`，这里仅仅保留对其的引用，不会复制任何模型或权重，并且该 encoder 模块并不包含 adaptor 模块。
+
+第三件事是保存梯度清理和 DDP 同步控制的回调。在某些框架中，`zero_grad_buffer` 是 `visual_mode.zero_grad_buffer` 这个可调用的函数对象，而 `no_sync` 是 `visual_model.no_sync`。前者用来清理框架的梯度缓冲区，graph slot 后续在 warmup 和捕获收尾等位置调用它，避免准备阶段产生的梯度混入正式训练；后者被调用后会提供一个上下文管理器，用于控制 DDP 的梯度同步行为，让准备和捕获阶段按所需方式运行。它不是 CUDA stream 的同步函数，不等价于“禁止所有通信”。这两个函数在 manager 初始化环节只是保留两个回调，不会在这里执行。
+
+第四件事是保存捕获使用的 stream、内存池和延迟捕获设置。具体来说，`capture_stream` 是之后传给 graph slot、用于 warmup 和 capture 的 CUDA stream，不会在 replay 环节被使用，默认值为 None；manager 初始化环节不会创建 stream，只提供参数传导功能，若传入给 graph slot 的 stream 为 None，则会在后续 graph slot 中自行创建。在共享图池路径中（下一章节会详细讲解，是一种显存优化手段），`prepare_shared_capture_inputs()` 会重新选择与 TE 捕获配合的 stream，所以它不是初始化后就永远不变的配置。内存池 `pool` 是 CUDA Graph 内存池的句柄，后续传给 `torch.cuda.graph(..., pool=...)`，这个在此前讲解 graph slot 的章节中有展示，让图捕获时的显存分配可以使用指定的池。它不是预先申请多少 GiB 显存的数值。默认值 None 表示这里尚未指定池；非共享路径的反向捕获会使用前向图的池，共享路径则由外层提供共同的池。延迟捕获设置是 `defer_capture`，用于决定 manager 是否把捕获时机交给外层协调，默认为 false，此时首次需要运行时调用 `_capture()` 建图，然后继续执行本次正式前向 replay；当设置为 true 时，manager 会保存输入模版并执行普通前向，等待外层分阶段捕获，图就绪后才改用 replay，因此取 false 并不意味着在本初始化函数内进行捕获，只是之后首次 `forward()` 可以自行触发捕获。
+
+初始化函数做的最后一件事是初始化生命周期状态，包括 `slots`、`graphs_ready`、`grad_init_graph` 和 `_capture_template`。`slots` 中的元素均为 `_GraphSlot` 对象，后者通过 ve cuda graph manager 的 `prepaer_capture()` 函数创建 wrapper 和 graph slot 并放入本列表；`graphs_ready` 在最初初始化时被标记成 false，表示建图流程尚未完成，在 manager 的 `finish_capture()` 完成了 graph slot 收尾后，会将其设置成 true；`grad_init_graph` 在初始化时为 None，表示尚无独立的梯度初始化图，后续共享捕获的训练路径中通过 `capture_grad_init()` 创建并在参数梯度累加前开始 replay；最后一个对象是 `_capture_template`，初始化时也为 None，表示尚未保存用于建图的输入样例，后续在延迟捕获时首次 `forward()` 保存输入副本，或在必要时通过 `ensure_capture_template()` 构造最小样例。
 
 
+## 5.2 整体前向行为
+
+## 5.3 _capture()
+
+## 5.4 prepaer_capture()
+
+## 5.5 captue_forward()
+
+## 5.6 capture_backward()
+
+## 5.7 finish_capture()
+
+## 5.8 reset()
 
 
-
-# cuda graph 接入训练流程的反向
-
-ve cuda graph 接入训练流程的反向需要专门的模块处理，在示例框架中，这个功能有模块  `_ForwardBackwardReplay` 负责。
-先看 forward()、backward()，再回看 _GraphSlot.forward_backward() 和 forward_only()。重点理解：前向结果为什么要 clone()；va 回传的梯度怎样填入固定缓冲区；ve 反向图怎样触发；pending 如何防止尚未完成反向就覆盖 slot。
-
-# ve cuda graph manager 维护 cuda graph 的完整生命周期
 
 读 VECudaGraphManager，把完整生命周期穿起来
 先看 __init__() 和 forward()，然后沿它们的调用读 prepaer_capture()、captue_forward()、capture_backward()、finish_capture()。此时将前面读过的组件拼起来：manager 决定捕获时机，slot 持有图和缓冲区，固有容量 wrapper 执行 ve，autograd bridge 连续训练反向。共性显存相关的 prepare_shared_capture_inputs()、capture_grad_init()、replay_grad_init()留到下一步一起读。
 
 
-# 共享显存链路
+# 6. 共享显存链路
 
 读共享显存链路，理解捕获顺序和梯度缓冲区生命周期。
 按下面的顺序跨文件阅读：
@@ -436,7 +582,7 @@ ve cuda graph 接入训练流程的反向需要专门的模块处理，在示例
 
 
 
-# ve cuda graph 兼容 ve 选择重计算
+# 7. ve cuda graph 兼容 ve 选择重计算
 
 
-# attention 模块与 MoE 算子
+# 8. attention 模块与 MoE 算子
