@@ -551,33 +551,155 @@ class VECudaGraphManager:
 
 ## 5.2 整体前向行为
 
+ve cuda graph manager 会根据当前状态选择普通前向、建图或前向 replay，这些行为均由 `forward()` 函数负责。具体来说，这个函数是 manager 处理本次 ve 输入的入口，决定用哪条路径计算：普通前向交给 tower，图的准备与 replay 则交给对应方法和 graph slot。返回的是本次输入的 ve 特征，后续 adapter 等计算在外层继续进行。
+
+```python
+def forward(self, images: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    if self.defer_capture and not self.graphs_ready:
+        if self._capture_template is None:
+            self._capture_template = (images.detach().clone(), grid_thw.detach().clone())
+        return self.tower(images, grid_thw)["last_hidden_state"]
+    if not self.slots:
+        self._capture(images, grid_thw)
+    if self.mode == "forward":
+        return self.slots[0].forward_only(images, grid_thw)
+    for slot in self.slots:
+        if not slot.pending:
+            return slot.forward_backward(images, grid_thw)
+    raise RuntimeError(f"VE CUDA Graph has more than {self.max_inflight} outstanding forwards")
+```
+
+`images` 是本次的视觉 patch token，`grid_thw` 描述对应图像或视频的网格布局。理解这段代码时，始终把“本次真实输入”和“保存下来用于建图的模板”分开。
+
+首先，若要求延迟捕获且图未就绪时，会保存捕获的模版并直接调用 `self.tower` 进行普通前向，此时 manager 不会自行触发捕获，共享图池路径需要外层安排 ve、ae、llm 等图的捕获顺序，所以这里线执行普通前向，等待合适的建图时机。所谓的模版，其实就是保存一份当前输入，通过 detach 切断保存的模版与原输入的 autograd 关系，剥离出计算图；通过 clone 为模版分配独立存储，原来的输入被修改或复用后，不会改变保存的模版。
+
+然后是 `forward()` 函数中最重要的行为，即在需要使用图但还没有任何 graph slot 时，先进行图捕获，会调用 ve cuda graph manager 的另一个核心功能函数 `_capture()` 来完成这个事，这个函数会在后续的小节展开说，这里只需要提一点的是，该核心功能函数完成了捕获前向图、反向图以及捕获完成后的后处理所有操作，并且执行完后并不会直接 return，后续才会调用 graph slot 执行本轮正式的前向 replay。
+
+`forward()` 中正式执行 replay 的详细执行步骤在此前的 graph slot 中有提到过，这里是更外层的处理，即完整的调用链是 ve cuda graph manager 调用 graph slot 的前向或前反向计算功能函数，再由功能函数内部进行 replay。ve cuda graph manager 根据 `mode` 来决定调用 graph slot 的哪个功能函数，`mode` 为 `forward` 时调用 `slot.forward_only()`，为 `forward_backward` 时调用 `slot.forward_backward()`。需要注意的是，这里进行前反向 replay 时会对 graph slot 的 `pending` 的状态进行检查，之前有提到过，执行完前向但没有执行反向的 graph slot 的 `pending` 会被标记成 true，该 graph slot 将不被允许被用作另一次 replay，直到完成了反向图的 replay，原因是另一次的 replay 的前向图输出会与前一次 replay 的前向图的输出踩踏，影响前一次 replay 的反向计算。
+
+目前部分框架虽然开放了 `max_inflight` 给用户设置，但是普遍设置为 1，因此 `self.slots` 列表中其实只包含一个 graph slot，在训练遍历前者并找到 `pending` 标记符合要求的 grpah slot 时，实际也只会检查一个 graph slot，目前的写法并不代表当前已经支持同时存在多个未完成的 ve 前向。最后如果没有找到可用的 graph slot 时会直接报错，比如所有的 graph slot 的  `pending` 标记均为 true。
+
+到目前为止，整个一次正常训练的调用已经可以串起来了。这个流程中，每次正式调用使用的都是本次的实际数据。图保存运算及固定地址，模板帮助完成建图；在已支持的容量和输入规格内，真实 token 数及布局的变化由 slot.prepare() 和固定容量 wrapper 处理：
+
+```text
+manager.forward(images, grid_thw)
+    → 必要时先完成直接捕获；已就绪则复用现有图
+    → 选择空闲 slot
+    → slot.prepare() 写入本次真实输入和布局
+    → 前向 replay，pending=True
+    → 返回 VE 特征，外层继续 adapter、LLM 和 loss 计算
+    → 外层安排必要的梯度缓冲区初始化，并进行相应反向
+    → 梯度到达 VE 输出，触发自定义 backward()
+    → 反向 replay，退出时 pending=False
+```
+
 ## 5.3 _capture()
 
-## 5.4 prepaer_capture()
+`_capture()` 函数负责把几个已经拆开的建图阶段按顺序执行。它接收用于本次建图的 `images` 和 `grid_thw`，最终让 manager 持有可用的 graph slot 和 CUDA Graph。它的返回类型是 None，不负责返回本轮训练的 ve 特征：
 
-## 5.5 captue_forward()
+```python
+def _capture(self, images: torch.Tensor, grid_thw: torch.Tensor) -> None:
+    self.prepare_capture(images, grid_thw)
+    self.capture_forward()
+    if self.mode == "forward_backward":
+        self.capture_backward()
+    self.finish_capture()
+```
 
-## 5.6 capture_backward()
+结构非常清晰，首先是 capture graph 之前的准备工作，通过 ve cuda graph manager 的功能函数 `prepare_capture()` 完成：
 
-## 5.7 finish_capture()
+```python
+def prepare_capture(self, images: torch.Tensor, grid_thw: torch.Tensor) -> None:
+    if self.slots:
+        raise RuntimeError("VE CUDA Graph slots are already prepared")
+    slot_count = self.max_inflight if self.mode == "forward_backward" else 1
+    for _ in range(slot_count):
+        fixed_ve = _FixedCapacityVE(
+            self.tower, self.max_tokens, self.max_segments, images, grid_thw
+        )
+        self.slots.append(
+            _GraphSlot(
+                fixed_ve,
+                images,
+                self.zero_grad_buffer,
+                self.no_sync,
+                capture_backward=self.mode == "forward_backward",
+                stream=self.capture_stream,
+                pool=self.pool,
+                defer_capture=True,
+            )
+        )
+```
 
-## 5.8 reset()
+准备环节会首先检查是否需要进行 capture，只会在 `self.slots` 为空时允许。`slot_count` 在仅需进行前向时被硬编码成 1，在需要进行前反向计算时会按照 `max_inflight` 取值，目前框架通常也指定为 1。然后按照 `slot_count` 进行定长 ve 的实例化以及 graph slot 的实例化，两者是一对一的，每个 graph slot 会维护一个定长 ve，并最终由 `self.slots` 维护所有的 graph slot。这里实际涉及的准备工作很多，主要是在实例化定长 ve 和实例化 graph slot 时，会涉及到包括固定缓冲区的准备、warmup 以及准备好定长计算对象等。
 
+准备工作之后，ve cuda graph manager 会调用第二个功能函数 `capture_forward()` 进行前向图的捕获，其最终调用层级是走到了 `slot.capture_forward_graph()`，后者在此前已经讲解过了，内部在指定 stream 和 pool 上执行了定长 ve 的前向，并完成了前向图的 capture。
 
+```python
+def capture_forward(self, before_capture: Callable[[], None] | None = None) -> None:
+    for index, slot in enumerate(self.slots):
+        slot.capture_forward_graph(
+            self.pool, before_capture=before_capture if index == 0 else None
+        )
+```
 
-读 VECudaGraphManager，把完整生命周期穿起来
-先看 __init__() 和 forward()，然后沿它们的调用读 prepaer_capture()、captue_forward()、capture_backward()、finish_capture()。此时将前面读过的组件拼起来：manager 决定捕获时机，slot 持有图和缓冲区，固有容量 wrapper 执行 ve，autograd bridge 连续训练反向。共性显存相关的 prepare_shared_capture_inputs()、capture_grad_init()、replay_grad_init()留到下一步一起读。
+然后是 `capture_backward()` 函数，其最终调用的也是 slot graph 的 `capture_backward_graph()`，在指定 stream 和 pool 上完成了反向图的捕获。**与前向图类似，捕获操作会遍历 `slots` 中所有 graph slot 并全部执行**。
 
+```python
+def capture_backward(self, before_capture: Callable[[], None] | None = None) -> None:
+    if self.mode != "forward_backward":
+        raise RuntimeError("forward-only VE manager has no backward graph")
+    for index, slot in enumerate(self.slots):
+        pool = self.pool if self.pool is not None else slot.forward_graph.pool()
+        slot.capture_backward_graph(pool, before_capture=before_capture if index == 0 else None)
+```
+
+流程的最后一步是 `finish_capture()` 函数，其也是遍历所有 graph slot 并调用后者的 `finish_capture()` 函数，一个额外的操作是将标记参数 `graphs_ready` 设置为 true，表明本 ve cuda graph manager 已经完成了图捕获行为：
+
+```python
+def finish_capture(self) -> None:
+    for slot in self.slots:
+        slot.finish_capture()
+    self.graphs_ready = True
+```
+
+最后要补充说明的是，ve cuda graph manager 还有一个 `reset()` 函数，将当前 manager 的图状态重置：
+
+```python
+def reset(self) -> None:
+    if any(slot.pending for slot in self.slots):
+        raise RuntimeError("cannot reset VE CUDA Graph with an outstanding forward")
+    for slot in self.slots:
+        slot.reset()
+    self.slots.clear()
+    if self.grad_init_graph is not None:
+        self.grad_init_graph.reset()
+        self.grad_init_graph = None
+    self.graphs_ready = False
+```
+
+其会将 ve cuda graph manager 的标记 `graphs_ready` 重置为 false，并遍历每一个 graph slot 进行图重置：
+
+```python
+def reset(self) -> None:
+    if hasattr(self, "forward_graph"):
+        self.forward_graph.reset()
+    if hasattr(self, "backward_graph"):
+        self.backward_graph.reset()
+    self.fa_saved_outputs.clear()
+```
 
 # 6. 共享显存链路
 
-读共享显存链路，理解捕获顺序和梯度缓冲区生命周期。
+
+
+
+读共享显存链路，理解捕获顺序、执行顺序和梯度缓冲区生命周期，明白如何确保显存复用正确。
 按下面的顺序跨文件阅读：
 * model_hybrid_vlm.py 的 capture_encoder_cuda_graphs()（model_hybrid_vlm.py:598）：先掌握 ve、llm 和梯度初始化图的捕获顺序。
-* 回到 manager 的三个共享捕获/梯度初始化函数，理解同一个 pool、capture stream和grad-init图如何建立。
+* 回到 manager 的三个共享捕获/梯度初始化函数，包括 capture_grad_init()、replay_grad_init()，理解同一个 pool、capture stream和grad-init图如何建立。
 * common/release_grad_util.py:179：看release、rebuild以及prepaer_model_grad_buffer_for_backward()。
 这一步最重要的是区分：捕获时真正分配和绑定梯度缓冲区；正式运行时保持地址固定，在指定边界 replay 清零。
-接着看 
 
 
 
