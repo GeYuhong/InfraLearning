@@ -1,4 +1,3 @@
-
 # 1. 入口
 
 从实现层面，将 cuda graph 接入到正式的训练修改。由于 cuda graph 替换的是某个前反向处理流程，可以在该处理的流程最外层的 `forward` 函数处增加 cuda graph 分支，该分支会调用一个独立的 graph manager 进行 ve cuda graph 前反向处理流程。
@@ -433,7 +432,7 @@ graph slot 在自定义模块输入函数中的角色非常重要，首先会判
 
 完成了前序准备工作后，直接调用 graph slot 维护的前向图进行 replay 即可，这才正式发起了本轮 ve 的前向 GPU 计算，前向图读取准备好的输入 `images` 和布局，以及当前参数，写出本轮输出和反向所需的中间结果。图的输出写入 slot 持有的固定输出存储，所以后面的 `slot.output` 能读到这次的结果。这里已经进入 replay 阶段，不再进行捕获。
 
-`forward()` 函数中剩下的处理则是服务于反向函数 `backward()` 和状态记录，即设置当前使用的 graph slot 的 `pending` 为 true，并将 graph slot 和 真实的 token 数都保存给反向使用，确保反向处理时知道梯度应该写入固定显存缓冲区的哪些位置。后续自定义的 `backward()` 函数在处理反向后，会将状态标记 `pending` 恢复成 false。需要注意的一点是，**前向函数最终返回结果时，返回的是真实 token 对应的输出，去掉了 padding 部分**。对返回的结果进行 `clone()` 也是必要的，因为当前使用的 graph slot 有可能后续被再次使用，并且被使用时，此前已有的输出结果可能还未被完全使用完成（例如多次 ve forward 前向完成后，再将多次 forward 的结果一起传给 llm backbone 部分处理），此时再次调用 `forward()` 会覆盖已有的输出，因此**有必要通过 `clone()` 复制成独立的 tensor**。
+`forward()` 函数中剩下的处理则是服务于反向函数 `backward()` 和状态记录，即设置当前使用的 graph slot 的 `pending` 为 true，并将 graph slot 和 真实的 token 数都保存给反向使用，确保反向处理时知道梯度应该写入固定显存缓冲区的哪些位置。后续自定义的 `backward()` 函数在处理反向后，会将状态标记 `pending` 恢复成 false。需要注意的一点是，**前向函数最终返回结果时，返回的是真实 token 对应的输出，去掉了 padding 部分**。对返回的结果进行 `clone()` 也是必要的，因为当前使用的 graph slot 有可能后续被再次使用，并且被使用时，此前已有的输出结果可能还未被完全使用完成（例如多次 ve forward 前向完成后，再将多次 forward 的结果一起传给 llm backbone 部分处理），此时再次调用 `forward()` 会覆盖已有的输出，因此**有必要通过** `clone()` **复制成独立的 tensor**。
 
 `forward()` 函数的输入中还有一个重要的参数是解包的 `*parameters`。被更新权重参数虽然不会在 `forward()` 函数中被显示使用，并且也不会被通过 ctx 保留给反向函数使用，但是依然要在这里传入，主要的原因有两个：首先，前向函数的输入中只有 images 拥有 `requires_grad` 属性，并且通常是 false，这意味着这个自定义模块不会创建对应的 autograd 反向节点，它的反向函数不会被调用执行，反向图不会进行 replay，这与预期的训练流程是完全不符的，因此提供被更新参数作为输入，可以将该自定义模块加入到训练的反向计算图中；第二，在后续进行反向 replay 时，真实计算得到的权重参数梯度有两种可能的存放位置，一个是写入到了捕获时绑定的参数梯度存储中，并在本自定义模块的反向返回，由外层 autograd/DDP 继续处理并累加到 `main_grad` 中，另一个存放位置时在 GPU 算子执行时直接将结果累加到 `main_grad` 中，此时本自定义模块返回的参数权重梯度主要起占位作用，配合后续待执行的 autograd/DDP hook，真实的梯度已经在 `main_grad` 中。
 
@@ -548,7 +547,6 @@ class VECudaGraphManager:
 
 初始化函数做的最后一件事是初始化生命周期状态，包括 `slots`、`graphs_ready`、`grad_init_graph` 和 `_capture_template`。`slots` 中的元素均为 `_GraphSlot` 对象，后者通过 ve cuda graph manager 的 `prepaer_capture()` 函数创建 wrapper 和 graph slot 并放入本列表；`graphs_ready` 在最初初始化时被标记成 false，表示建图流程尚未完成，在 manager 的 `finish_capture()` 完成了 graph slot 收尾后，会将其设置成 true；`grad_init_graph` 在初始化时为 None，表示尚无独立的梯度初始化图，后续共享捕获的训练路径中通过 `capture_grad_init()` 创建并在参数梯度累加前开始 replay；最后一个对象是 `_capture_template`，初始化时也为 None，表示尚未保存用于建图的输入样例，后续在延迟捕获时首次 `forward()` 保存输入副本，或在必要时通过 `ensure_capture_template()` 构造最小样例。
 
-
 ## 5.2 整体前向行为
 
 ve cuda graph manager 会根据当前状态选择普通前向、建图或前向 replay，这些行为均由 `forward()` 函数负责。具体来说，这个函数是 manager 处理本次 ve 输入的入口，决定用哪条路径计算：普通前向交给 tower，图的准备与 replay 则交给对应方法和 graph slot。返回的是本次输入的 ve 特征，后续 adapter 等计算在外层继续进行。
@@ -643,7 +641,7 @@ def capture_forward(self, before_capture: Callable[[], None] | None = None) -> N
         )
 ```
 
-然后是 `capture_backward()` 函数，其最终调用的也是 slot graph 的 `capture_backward_graph()`，在指定 stream 和 pool 上完成了反向图的捕获。**与前向图类似，捕获操作会遍历 `slots` 中所有 graph slot 并全部执行**。
+然后是 `capture_backward()` 函数，其最终调用的也是 slot graph 的 `capture_backward_graph()`，在指定 stream 和 pool 上完成了反向图的捕获。**与前向图类似，捕获操作会遍历** `slots` **中所有 graph slot 并全部执行**。
 
 ```python
 def capture_backward(self, before_capture: Callable[[], None] | None = None) -> None:
@@ -691,20 +689,327 @@ def reset(self) -> None:
 
 # 6. 共享显存链路
 
+一些多模态训练框架会让 VE、AE 和 LLM 的 CUDA Graph 共用显存池，以复用不同计算阶段的临时存储。本节沿用前文的 manager 和 graph slot，以一组实现片段为例，讲解捕获编排、梯度缓冲区和调度器怎样配合完成复用。下面的函数名、配置和调用顺序都属于这个示例，阅读时关注各部分的职责与协作关系即可。
 
+## 6.1 共享显存的目的与捕获入口
 
+前面第五节的 `_capture()` 会连续完成 VE 前向和反向图的捕获。这里的共享显存方案会在两者之间插入 LLM 的捕获，使显存分配器能够按照各阶段的存储生命周期安排复用，因此通过 `defer_capture=True` 将捕获时机交给外层。**共享的是 CUDA Graph 显存池中可以复用的存储，各模型仍持有自己的权重和图。**
 
-读共享显存链路，理解捕获顺序、执行顺序和梯度缓冲区生命周期，明白如何确保显存复用正确。
-按下面的顺序跨文件阅读：
-* model_hybrid_vlm.py 的 capture_encoder_cuda_graphs()（model_hybrid_vlm.py:598）：先掌握 ve、llm 和梯度初始化图的捕获顺序。
-* 回到 manager 的三个共享捕获/梯度初始化函数，包括 capture_grad_init()、replay_grad_init()，理解同一个 pool、capture stream和grad-init图如何建立。
-* common/release_grad_util.py:179：看release、rebuild以及prepaer_model_grad_buffer_for_backward()。
-这一步最重要的是区分：捕获时真正分配和绑定梯度缓冲区；正式运行时保持地址固定，在指定边界 replay 清零。
+以下示例以需要训练 VE、并启用梯度缓冲区重建的路径为主，对应配置为 `ve_cuda_graph.mode=forward_backward` 和 `distributed.ddp.rebuild_grad_buffer=True`。示例中的 `_validate_args()` 还要求配合 TE（Transformer Engine）的 `full_layer` 或 `vpp_stage` CUDA Graph、pipeline executor、至少一次训练 warmup，以及 `PYTORCH_CUDA_ALLOC_CONF` 中的 `expandable_segments:True`；这些是该实现的配置约束。在同一示例中，冻结 VE 的 `forward` 模式也可以共享 LLM 图池，但不捕获 VE 的梯度初始化图和反向图，adapter 仍通过普通 autograd 训练。
 
+有些框架会由 trainer 统一协调 encoder 与 LLM 的捕获时机。例如，下面的 trainer 代码通过两个回调，把 encoder 的捕获接入 LLM 的建图流程；片段省略了外层轮次判断及其他训练逻辑：
 
+```python
+if use_ve_shared_graph_pool:
+    ve_llm_graph_pool = cuda_graph_helper.new_shared_pool()
+    with self._model_main.capture_encoder_cuda_graphs(ve_llm_graph_pool) as (
+        start_ve_capture,
+        finish_ve_capture,
+    ):
+        cuda_graph_helper.create_cudagraphs(
+            before_model_capture=start_ve_capture,
+            before_optimizer_capture=finish_ve_capture,
+        )
+```
 
+`new_shared_pool()` 创建本次捕获共用的 pool 句柄；pool 不是预先指定的显存容量。模型侧的 `capture_encoder_cuda_graphs()` 是上下文管理器，它把两个回调交给负责 LLM 的 TE graph manager，分别在 LLM 捕获之前和之后执行。示例中的 `create_cudagraphs()` 按以下顺序调用，若配置了 optimizer graph，则最后才捕获 optimizer：
+
+```text
+start_ve_capture()
+    → LLM 前向、反向图捕获
+    → 清理对应 scope 已不再需要的捕获缓存
+    → finish_ve_capture()
+    → optimizer graph 捕获（若启用）
+```
+
+这里的两个回调是外层捕获流程的 Python 调用，不是前面 graph slot 中的 `before_capture` 参数，也不会因为之后调用某张图的 `replay()` 而重新执行。LLM 部分内部仍遵循它自己的 microbatch 和 pipeline 捕获顺序，本节只关注它与 encoder 的边界。
+
+## 6.2 统一 pool 和 stream，再捕获 encoder 前向
+
+模型侧的 `capture_encoder_cuda_graphs()` 首先收集已有且设置了 `defer_capture` 的 encoder manager，记作 `participants`，再把其中 `mode=forward_backward` 的成员放入 `backward_participants`。示例按 VE 在前、AE 在后的顺序组织成员；只有 VE 时就是一个成员。没有参与者时直接交回两个 None 回调，有参与者但没有共享 pool 时则报错。
+
+下面是这个上下文管理器内部的第一个完整回调：
+
+```python
+def start_ve_capture():
+    nonlocal started
+    if started:
+        return
+    torch.cuda.synchronize()
+    if backward_participants:
+        self._zero_encoder_graph_optimizer_grads(
+            wrapper for wrapper, _ in backward_participants
+        )
+    # Prepare every encoder before capturing any new graph. Preparation
+    # may reset old graphs, which can clear stream-local BLAS caches.
+    for _, manager in participants:
+        manager.prepare_shared_capture_inputs(pool)
+    # Existing execution order: VE F -> AE F, then LLM F/B.
+    for _, manager in participants:
+        manager.capture_forward()
+    for wrapper, _ in backward_participants:
+        release_model_grad_buffer(wrapper, force=True)
+    started = True
+```
+
+这个回调先等待此前 GPU 工作完成，并清除相关 optimizer 持有的梯度引用，再准备所有 encoder。`_zero_encoder_graph_optimizer_grads()` 调用对应 optimizer 的 `zero_grad(set_to_none=True)`；示例将这条共享重建路径限定为 encoder 使用独立的 Adam optimizer，不能与 LLM 共用同一个叶子 optimizer，以便单独管理 encoder 的梯度引用。
+
+准备工作与前向捕获被拆成两个循环，是因为准备时可能重置旧图并清理 stream 上的 BLAS 缓存。先把所有准备完成，才能避免准备第二个 encoder 时影响已经捕获好的第一个 encoder。VE manager 的准备函数如下：
+
+```python
+def prepare_shared_capture_inputs(self, pool) -> None:
+    if not self.defer_capture:
+        raise RuntimeError("VE CUDA Graph manager is not configured for shared capture")
+    self.ensure_capture_template()
+    self.reset()
+    self.pool = pool
+    # TE uses torch.cuda.graph without an explicit stream. Constructing the
+    # same context (without entering capture) selects its process-wide default
+    # side stream, so allocator blocks are reusable across VE and TE captures.
+    capture_context = torch.cuda.graph(torch.cuda.CUDAGraph(), pool=pool)
+    self.capture_stream = capture_context.capture_stream
+    images, grid_thw = self._capture_template
+    self.prepare_capture(images, grid_thw)
+```
+
+`ensure_capture_template()` 保证存在建图输入：通常沿用延迟捕获期间保存的输入，若该 rank 的 encoder 在 warmup 时一直没有数据，则构造最小样例。随后 `reset()` 清理旧图状态，但保留模板；`prepare_capture()` 继续执行第五节介绍的 wrapper、slot 创建和 warmup。
+
+这里除了统一 `pool`，还专门选择了与 LLM 一致的捕获 stream。示例中的 TE graph manager 使用未显式指定 stream 的 `torch.cuda.graph()`，因此 VE 也先构造相同的上下文对象，读取其默认捕获 stream。**这里只创建上下文对象，没有进入** `with`**，所以还没有开始捕获。** 后续 VE 的前向、梯度初始化和反向捕获都会使用这个 stream，便于分配器跨 VE、LLM 捕获复用显存块；正式 replay 仍在调用时的当前 stream 上提交，不由这个属性指定。
+
+所有准备完成后，回调才依次捕获 VE、AE 前向，并对需要反向的 encoder wrapper 强制释放梯度缓冲区。此时还没有本轮正式训练的 encoder 梯度需要保留；把梯度存储的重新分配推迟到 LLM 捕获之后，才能让它有机会复用 LLM 阶段结束后可用的图池存储。
+
+## 6.3 LLM 捕获之后，先初始化梯度再捕获 encoder 反向
+
+LLM 图捕获完成后，TE graph manager 调用第二个回调 `finish_ve_capture()`。示例的 `vpp_stage` 路径还会先释放部分 MoE 通信管理器的捕获缓存引用，为后续梯度缓冲区重建提供复用机会。这个回调仍定义在模型侧的 `capture_encoder_cuda_graphs()` 内部：
+
+```python
+def finish_ve_capture():
+    nonlocal finished
+    if finished:
+        return
+    start_ve_capture()
+    for wrapper, manager in backward_participants:
+        manager.capture_grad_init(
+            lambda wrapper=wrapper: rebuild_model_grad_buffer(wrapper, force=True)
+        )
+    # Existing joint backward executes AE before VE.
+    for _, manager in reversed(backward_participants):
+        manager.capture_backward()
+    for _, manager in participants:
+        manager.finish_capture()
+    if backward_participants:
+        self._set_cuda_graph_static_grad_buffers(True)
+    for wrapper, manager in backward_participants:
+        wrapper._cuda_graph_prepare_grad_buffer = manager.replay_grad_init
+    finished = True
+    logger.info("[encoder_cuda_graph] coordinated capture complete")
+```
+
+`started` 和 `finished` 防止两个回调重复执行，`finish_ve_capture()` 开头再调用一次 `start_ve_capture()` 是为了保证前向准备已经完成。接着，代码先为所有需要训练的 encoder 捕获梯度初始化图，再按 AE、VE 的逆序捕获反向图。只有 VE 时，核心顺序就是 VE 前向 → LLM 前反向 → VE 梯度初始化 → VE 反向。
+
+独立的梯度初始化图由 `VECudaGraphManager.capture_grad_init()` 创建：
+
+```python
+def capture_grad_init(self, rebuild_grad_buffer: Callable[[], None]) -> None:
+    """Allocate/bind once; replay the captured zero before eager VA backward."""
+    if not self.defer_capture or len(self.slots) != 1:
+        raise RuntimeError("VE grad-init graph requires shared capture with one slot")
+    if self.grad_init_graph is not None:
+        raise RuntimeError("VE grad-init graph is already captured")
+    self.grad_init_graph = torch.cuda.CUDAGraph()
+    with (
+        pinned_memory_capture_lock,
+        torch.cuda.graph(self.grad_init_graph, pool=self.pool, stream=self.capture_stream),
+    ):
+        rebuild_grad_buffer()
+    self.slots[0].requires_grad_init = True
+```
+
+传入的 `rebuild_grad_buffer` 是绑定了当前 DDP wrapper 的回调。因为上一阶段已释放旧的梯度缓冲区，这次在图捕获上下文中执行重建时，会从共享 pool 分配新存储，绑定各参数的 `main_grad`，并把清零操作记录到 `grad_init_graph`。随后 VE 反向捕获使用的就是这次绑定的地址。`requires_grad_init=True` 则告诉第四节的 autograd bridge：每轮反向开始前，必须已经完成梯度初始化。
+
+最后，各 manager 按第五节的逻辑完成 `finish_capture()`，并标记图已就绪。外层同时启用梯度缓冲区的静态地址保护，把 `manager.replay_grad_init` 挂到 wrapper 的 `_cuda_graph_prepare_grad_buffer` 上，供调度器在正式训练中调用。初始化图与反向图分开，是为了让清零发生在整个视觉分支反向之前，而不是等到 VE 反向图即将 replay 时才清零。
+
+## 6.4 捕获阶段怎样释放、重建和绑定梯度缓冲区
+
+本节展开前两小节已经调用的梯度管理接口。先看释放端：6.2 的 `start_ve_capture()` 在 **encoder 前向图捕获完成之后、LLM 图捕获开始之前**，调用 `release_model_grad_buffer(wrapper, force=True)`。这个模型级入口检查 DDP 类型和静态保护状态，然后遍历普通参数与 expert parallel 参数的梯度缓冲区，逐个调用下面的 `release_grad_buffer()`：
+
+```text
+start_ve_capture()
+    → release_model_grad_buffer(wrapper, force=True)
+    → 遍历 wrapper 中的梯度 buffer
+    → release_grad_buffer(wrapper, buffer)
+```
+
+因此，`release_grad_buffer(model, buffer)` 中的 `model` 就是上面的 DDP `wrapper`，`buffer` 是它管理的某一个梯度缓冲区；这个函数只处理单个 buffer。调用方的 `force=True` 使本次建图时的释放绕过静态保护，保护机制在 6.5 展开。
+
+`buffer.grad_data` 持有连续的梯度存储，`bucket.grad_data` 和参数的 `main_grad` 是其中不同范围的视图。在这个示例中，视觉模型的 wrapper 同时包含 VE tower 和 adapter，因此需要一起管理它们的梯度存储。单个缓冲区的释放实现如下：
+
+```python
+def release_grad_buffer(model, buffer):
+    if buffer.grad_data is None:
+        return
+    # release grad buffer
+    buffer.grad_data = None
+    cur_bucket_id = -1
+    for param in buffer.param_index_map.keys():
+        data_start_index, data_end_index, bucket_id = buffer.param_index_map[param]
+        if bucket_id != cur_bucket_id:
+            assert bucket_id == (cur_bucket_id + 1)
+            bucket = buffer.buckets[bucket_id]
+            # detach bucket view reference to grad_data
+            bucket.grad_data = None
+            cur_bucket_id = bucket_id
+        # detach main_grad view reference to grad_data
+        param.main_grad = None
+    _refresh_grouped_main_grads(model, buffer)
+```
+
+释放时不能只把 `buffer.grad_data` 设成 None，因为 bucket 和参数的视图也持有底层存储。这里依次解除这些引用，再刷新 TE grouped weight 缓存的梯度视图，使它们跟随本次释放。它没有把梯度搬到 CPU，也没有释放模型权重；存储能否被分配器回收，取决于相关引用是否都已解除。
+
+对应的重建入口在 6.3 的 `finish_ve_capture()` 中：此时 **LLM 前反向图已捕获，encoder 反向图尚未捕获**。它把重建回调传给 `manager.capture_grad_init()`，由后者在指定共享 pool 的捕获上下文中执行：
+
+```text
+finish_ve_capture()
+    → manager.capture_grad_init(重建回调)
+    → 在 torch.cuda.graph(...) 内调用回调
+    → rebuild_model_grad_buffer(wrapper, force=True)
+    → 遍历 wrapper 中的梯度 buffer
+    → rebuild_grad_buffer(wrapper, buffer)
+```
+
+这里有两个同名位置需要区分：`capture_grad_init()` 的形参 `rebuild_grad_buffer` 保存的是前文传入的无参 lambda 回调；它通过模型级入口 `rebuild_model_grad_buffer()`，才调用到下面接收 `model, buffer` 两个参数的具体函数。这个函数先分配并清零连续存储，再按原来的参数和 bucket 索引恢复视图：
+
+```python
+def rebuild_grad_buffer(model, buffer):
+    if buffer.grad_data is not None:
+        return
+    assert buffer.grad_data is None, "grad data is not none"
+    # rebuild grad_data
+    buffer.grad_data = torch.empty(
+        buffer.numel,
+        dtype=buffer.grad_dtype,
+        device=torch.cuda.current_device(),
+        requires_grad=False,
+    )
+    buffer.grad_data.zero_()
+    cur_bucket_id = -1
+    for param in buffer.param_index_map.keys():
+        data_start_index, data_end_index, bucket_id = buffer.param_index_map[param]
+        if bucket_id != cur_bucket_id:
+            assert bucket_id == (cur_bucket_id + 1)
+            bucket = buffer.buckets[bucket_id]
+            bucket_start_index, bucket_end_index = buffer.bucket_indices[bucket_id]
+            # remap main_grad of the param
+            bucketed_grad_data = buffer._get(
+                torch.Size([bucket_end_index - bucket_start_index]),
+                bucket_start_index,
+                buffer_type=BufferType.GRAD,
+            )
+            bucket.grad_data = bucketed_grad_data
+            cur_bucket_id = bucket_id
+        # remap main_grad of the param
+        param.main_grad = buffer._get(
+            param.data.shape, data_start_index, buffer_type=BufferType.GRAD
+        )
+    _refresh_grouped_main_grads(model, buffer)
+```
+
+`buffer._get()` 从连续存储中取出对应区间并恢复所需 shape，不为每个参数另复制一份梯度。`_refresh_grouped_main_grads()` 再把 TE 内部缓存的视图绑定到新存储，使后续 fused 算子也能写到正确的 `main_grad`。
+
+**在这条共享捕获路径中，释放旧存储、分配新 Tensor 和绑定视图都属于建图阶段；正式 replay 不会重新运行这些 Python 代码。** 初始化图重放的是已经记录的 GPU 清零操作，反向图重放的是向已绑定地址计算、累加梯度的 GPU 操作。因此，两张图建立以后，不能再随意释放这块存储或把 `main_grad` 换到别的地址；6.5 继续说明如何保护这些地址，并在每轮需要时清零。
+
+共享显存的关键也在这里：捕获 LLM 时，它的一些临时存储在自己的前反向结束后已可复用；随后分配的 encoder 梯度缓冲区可能落在这些地址上。正式运行时，LLM 图仍可以先向那些地址写入临时数据，之后再由初始化图清零，交给 encoder 反向使用。并不是图池中的全部张量都能这样重叠，例如 VE 前向保存、反向仍要读取的激活必须跨过 LLM 阶段保持有效；仅仅传入同一个 pool，并不代表所有显存都会自动省下来。
+
+## 6.5 正式运行时保持地址固定，在反向边界 replay 清零
+
+为了在捕获完成后固定梯度地址，示例通过 `_set_cuda_graph_static_grad_buffers(True)` 给 LLM 的 DDP chunks 和参与共享反向捕获的 encoder DDP wrapper 设置 `_cuda_graph_static_grad_buffer=True`。`release_model_grad_buffer()` 和 `rebuild_model_grad_buffer()` 都检查这个标记；下面节选前者通过模型类型检查之后的部分，后者使用相同的静态保护条件：
+
+```python
+if getattr(model, "_cuda_graph_static_grad_buffer", False) and not force:
+    return
+for buffer in model.buffers:
+    release_grad_buffer(model, buffer)
+if hasattr(model, "expert_parallel_buffers"):
+    for buffer in model.expert_parallel_buffers:
+        release_grad_buffer(model, buffer)
+```
+
+因此，捕获阶段传入 `force=True` 可以真正释放和重建缓冲区；进入正式训练后，普通 release、rebuild 调用会直接返回，不再改变图依赖的地址。这个保护同时覆盖普通参数和 expert parallel 参数的缓冲区。Tensor 引用被保留下来，并不会取消捕获时已经形成的地址复用关系。
+
+需要在反向前清零时，调度器调用的是专门的入口 `prepare_model_grad_buffer_for_backward()`：
+
+```python
+def prepare_model_grad_buffer_for_backward(model):
+    """Scheduler boundary: rebuild eager buffers or zero static graph buffers."""
+    if isinstance(model, list):
+        for m in model:
+            prepare_model_grad_buffer_for_backward(m)
+        return
+    prepare = getattr(model, "_cuda_graph_prepare_grad_buffer", None)
+    if getattr(model, "_cuda_graph_static_grad_buffer", False) and prepare is not None:
+        prepare()
+    else:
+        rebuild_model_grad_buffer(model)
+```
+
+普通模型继续走原来的重建路径；具有静态标记且挂有准备回调的 encoder，则调用前面安装的 `manager.replay_grad_init()`。LLM chunk 虽然也会被标记为静态，但这里没有为它安装 encoder 的准备回调，不能把静态标记理解成“所有模型都调用 VE 的初始化图”。
+
+```python
+def replay_grad_init(self) -> None:
+    if not self.graphs_ready or self.grad_init_graph is None:
+        raise RuntimeError("VE grad-init graph is not ready")
+    slot = self.slots[0]
+    if slot.pending and slot.grad_initialized:
+        raise RuntimeError("VE grad-init graph was already replayed for this forward")
+    # Even an image-free iteration must discard LLM data at aliased grad addresses.
+    self.grad_init_graph.replay()
+    slot.grad_initialized = slot.pending
+```
+
+清零后，如果该 slot 有等待反向的前向，才把 `grad_initialized` 置为 True。同一次待完成的前向不允许重复初始化，否则可能擦掉已累加的梯度；反向 bridge 会检查这个标记，并在退出反向时复位。即使本轮没有图像、`pending=False`，也仍然需要清零，因为这些梯度地址可能已经被 LLM 写入临时数据，不能把残留内容当成本轮梯度。
+
+这里清理的是参数的梯度缓冲区，与第四节的 `slot.grad_output` 不同：后者存放下游传给 VE 输出的梯度，在 VE 反向 replay 前复制；前者用于累加 VE 和 adapter 的参数梯度，必须在它们开始写入之前初始化。
+
+## 6.6 调度顺序怎样保证共享存储不会被误用
+
+有些框架会把梯度缓冲区的处理边界作为显式操作插入 pipeline 调度计划。例如，调度器中的 `add_encoder_grad_buffer_ops()` 在满足“encoder 前向全部位于 LLM 之前、encoder 反向全部位于 LLM 之后”的计划中，插入 `VEGRADBUFFERRELEASE` 和 `VEGRADBUFFERREBUILD`。模型侧的 `validate_ve_cuda_graph_shared_schedule()` 再校验共享训练路径恰好各有一个这样的操作，并检查它们与所有 encoder、LLM 计算的位置关系，不符合时直接报错。
+
+调度器负责安排操作的位置，pipeline executor 负责执行。下面是示例中 rebuild 调度操作的完整处理函数，普通 pipeline 和 virtual pipeline 的 executor 都采用这个逻辑：
+
+```python
+def encoder_grad_buffer_rebuild_action(self, op: ScheduleOp):
+    if not self.rebuild_grad_buffer:
+        return
+    if not self.encoder_models:
+        return
+    prepare_model_grad_buffer_for_backward(self.encoder_models)
+```
+
+虽然调度操作的名字仍然叫 rebuild，图已就绪时实际执行的是上一小节的初始化图 replay。release 操作仍调用 `release_model_grad_buffer()`，但对静态缓冲区不会真正释放。省略通信等无关操作后，这个示例在正式训练中的视觉分支沿以下路径执行：
+
+```text
+VE 前向 replay，随后完成 adapter 前向
+    → VEGRADBUFFERRELEASE：静态缓冲区保持绑定
+    → LLM 前向、反向：可能改写与 encoder 梯度存储重叠的地址
+    → VEGRADBUFFERREBUILD
+        → prepare_model_grad_buffer_for_backward()
+        → manager.replay_grad_init()：清零参数梯度缓冲区
+    → VEBACKWARD：进入视觉分支的 autograd 反向
+        → adapter 反向，累加 adapter 参数梯度
+        → VE 的 _ForwardBackwardReplay.backward()
+        → 检查初始化状态，replay VE 反向图，累加 VE 参数梯度
+    → 后续梯度同步与 optimizer 处理
+```
+
+这个边界必须放在 **adapter 反向之前**。adapter 的梯度也写入该 DDP wrapper 的缓冲区，如果把清零放到 VE 反向图内部，执行到那里时 adapter 已经完成反向，它的梯度就会被清掉。反过来，只在 iter 开头清零也不够，因为后面的 LLM 计算可能再次向重叠地址写入数据。
+
+复用要求 GPU 上的实际读写顺序遵守这些生命周期约束，不能因为有多个 graph 对象就任意并发 replay；CPU 上设置 `pending`、`grad_initialized` 只是在检查流程状态，GPU 工作之间的先后关系仍由 stream 和相应的同步依赖保证。VE 前向需要保留给反向的数据、LLM 尚未消费完的数据，都不能提前让给其他阶段覆盖。
+
+捕获失败时，`capture_encoder_cuda_graphs()` 的异常分支会关闭静态标记并移除准备回调，重置参与的 encoder manager，再强制重建其梯度缓冲区，最后继续抛出异常；正常退出但尚未调用完成回调时，则补调 `finish_ve_capture()`。这些是捕获过程的收尾逻辑，不是每轮 replay 都会执行的操作。
 
 # 7. ve cuda graph 兼容 ve 选择重计算
 
-
 # 8. attention 模块与 MoE 算子
+
+# 9. Q&A
+
