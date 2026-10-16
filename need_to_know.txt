@@ -2,3 +2,6 @@
 2. max connextion
 3. avoid record stream
 4. 矩阵运算的 flops mnk 是否有考虑乘和加？
+5. offload 和 cuda graph 的兼容性问题
+6. record stream 和 wait stream
+7. 大规模训练时遇到的问题
